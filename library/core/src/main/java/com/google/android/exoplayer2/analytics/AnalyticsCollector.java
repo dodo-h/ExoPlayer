@@ -15,23 +15,30 @@
  */
 package com.google.android.exoplayer2.analytics;
 
-import android.net.NetworkInfo;
-import android.support.annotation.Nullable;
+import static com.google.android.exoplayer2.util.Assertions.checkNotNull;
+
 import android.view.Surface;
+import androidx.annotation.Nullable;
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.ExoPlaybackException;
 import com.google.android.exoplayer2.Format;
+import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.PlaybackParameters;
 import com.google.android.exoplayer2.Player;
+import com.google.android.exoplayer2.Player.PlaybackSuppressionReason;
 import com.google.android.exoplayer2.Timeline;
 import com.google.android.exoplayer2.Timeline.Period;
 import com.google.android.exoplayer2.Timeline.Window;
 import com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime;
+import com.google.android.exoplayer2.audio.AudioAttributes;
+import com.google.android.exoplayer2.audio.AudioListener;
 import com.google.android.exoplayer2.audio.AudioRendererEventListener;
 import com.google.android.exoplayer2.decoder.DecoderCounters;
-import com.google.android.exoplayer2.drm.DefaultDrmSessionEventListener;
+import com.google.android.exoplayer2.drm.DrmSessionEventListener;
 import com.google.android.exoplayer2.metadata.Metadata;
 import com.google.android.exoplayer2.metadata.MetadataOutput;
+import com.google.android.exoplayer2.source.LoadEventInfo;
+import com.google.android.exoplayer2.source.MediaLoadData;
 import com.google.android.exoplayer2.source.MediaSource.MediaPeriodId;
 import com.google.android.exoplayer2.source.MediaSourceEventListener;
 import com.google.android.exoplayer2.source.TrackGroupArray;
@@ -39,14 +46,17 @@ import com.google.android.exoplayer2.trackselection.TrackSelectionArray;
 import com.google.android.exoplayer2.upstream.BandwidthMeter;
 import com.google.android.exoplayer2.util.Assertions;
 import com.google.android.exoplayer2.util.Clock;
+import com.google.android.exoplayer2.video.VideoListener;
 import com.google.android.exoplayer2.video.VideoRendererEventListener;
+import com.google.common.base.Objects;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
+import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
 /**
  * Data collector which is able to forward analytics events to {@link AnalyticsListener}s by
@@ -59,46 +69,30 @@ public class AnalyticsCollector
         VideoRendererEventListener,
         MediaSourceEventListener,
         BandwidthMeter.EventListener,
-        DefaultDrmSessionEventListener {
-
-  /** Factory for an analytics collector. */
-  public static class Factory {
-
-    /**
-     * Creates an analytics collector for the specified player.
-     *
-     * @param player The {@link Player} for which data will be collected. Can be null, if the player
-     *     is set by calling {@link AnalyticsCollector#setPlayer(Player)} before using the analytics
-     *     collector.
-     * @param clock A {@link Clock} used to generate timestamps.
-     * @return An analytics collector.
-     */
-    public AnalyticsCollector createAnalyticsCollector(@Nullable Player player, Clock clock) {
-      return new AnalyticsCollector(player, clock);
-    }
-  }
+        DrmSessionEventListener,
+        VideoListener,
+        AudioListener {
 
   private final CopyOnWriteArraySet<AnalyticsListener> listeners;
   private final Clock clock;
+  private final Period period;
   private final Window window;
   private final MediaPeriodQueueTracker mediaPeriodQueueTracker;
 
   private @MonotonicNonNull Player player;
+  private boolean isSeeking;
 
   /**
-   * Creates an analytics collector for the specified player.
+   * Creates an analytics collector.
    *
-   * @param player The {@link Player} for which data will be collected. Can be null, if the player
-   *     is set by calling {@link AnalyticsCollector#setPlayer(Player)} before using the analytics
-   *     collector.
    * @param clock A {@link Clock} used to generate timestamps.
    */
-  protected AnalyticsCollector(@Nullable Player player, Clock clock) {
-    this.player = player;
-    this.clock = Assertions.checkNotNull(clock);
+  public AnalyticsCollector(Clock clock) {
+    this.clock = checkNotNull(clock);
     listeners = new CopyOnWriteArraySet<>();
-    mediaPeriodQueueTracker = new MediaPeriodQueueTracker();
+    period = new Period();
     window = new Window();
+    mediaPeriodQueueTracker = new MediaPeriodQueueTracker(period);
   }
 
   /**
@@ -107,6 +101,7 @@ public class AnalyticsCollector
    * @param listener The listener to add.
    */
   public void addListener(AnalyticsListener listener) {
+    Assertions.checkNotNull(listener);
     listeners.add(listener);
   }
 
@@ -121,13 +116,28 @@ public class AnalyticsCollector
 
   /**
    * Sets the player for which data will be collected. Must only be called if no player has been set
-   * yet.
+   * yet or the current player is idle.
    *
    * @param player The {@link Player} for which data will be collected.
    */
   public void setPlayer(Player player) {
-    Assertions.checkState(this.player == null);
-    this.player = Assertions.checkNotNull(player);
+    Assertions.checkState(
+        this.player == null || mediaPeriodQueueTracker.mediaPeriodQueue.isEmpty());
+    this.player = checkNotNull(player);
+  }
+
+  /**
+   * Updates the playback queue information used for event association.
+   *
+   * <p>Should only be called by the player controlling the queue and not from app code.
+   *
+   * @param queue The playback queue of media periods identified by their {@link MediaPeriodId}.
+   * @param readingPeriod The media period in the queue that is currently being read by renderers,
+   *     or null if the queue is empty.
+   */
+  public void updateMediaPeriodQueueInfo(
+      List<MediaPeriodId> queue, @Nullable MediaPeriodId readingPeriod) {
+    mediaPeriodQueueTracker.onQueueUpdated(queue, readingPeriod, checkNotNull(player));
   }
 
   // External events.
@@ -137,58 +147,25 @@ public class AnalyticsCollector
    * adjusts its state and position to the seek.
    */
   public final void notifySeekStarted() {
-    if (!mediaPeriodQueueTracker.isSeeking()) {
-      EventTime eventTime = generatePlayingMediaPeriodEventTime();
-      mediaPeriodQueueTracker.onSeekStarted();
+    if (!isSeeking) {
+      EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+      isSeeking = true;
       for (AnalyticsListener listener : listeners) {
         listener.onSeekStarted(eventTime);
       }
     }
   }
 
-  /**
-   * Notify analytics collector that the viewport size changed.
-   *
-   * @param width The new width of the viewport in device-independent pixels (dp).
-   * @param height The new height of the viewport in device-independent pixels (dp).
-   */
-  public final void notifyViewportSizeChanged(int width, int height) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
-    for (AnalyticsListener listener : listeners) {
-      listener.onViewportSizeChange(eventTime, width, height);
-    }
-  }
-
-  /**
-   * Notify analytics collector that the network type or connectivity changed.
-   *
-   * @param networkInfo The new network info, or null if no network connection exists.
-   */
-  public final void notifyNetworkTypeChanged(@Nullable NetworkInfo networkInfo) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
-    for (AnalyticsListener listener : listeners) {
-      listener.onNetworkTypeChanged(eventTime, networkInfo);
-    }
-  }
-
-  /**
-   * Resets the analytics collector for a new media source. Should be called before the player is
-   * prepared with a new media source.
-   */
-  public final void resetForNewMediaSource() {
-    // Copying the list is needed because onMediaPeriodReleased will modify the list.
-    List<WindowAndMediaPeriodId> activeMediaPeriods =
-        new ArrayList<>(mediaPeriodQueueTracker.activeMediaPeriods);
-    for (WindowAndMediaPeriodId mediaPeriod : activeMediaPeriods) {
-      onMediaPeriodReleased(mediaPeriod.windowIndex, mediaPeriod.mediaPeriodId);
-    }
+  /** Resets the analytics collector for a new playlist. */
+  public final void resetForNewPlaylist() {
+    // TODO: remove method.
   }
 
   // MetadataOutput implementation.
 
   @Override
   public final void onMetadata(Metadata metadata) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onMetadata(eventTime, metadata);
     }
@@ -196,14 +173,66 @@ public class AnalyticsCollector
 
   // AudioRendererEventListener implementation.
 
+  @SuppressWarnings("deprecation")
   @Override
   public final void onAudioEnabled(DecoderCounters counters) {
-    // The renderers are only enabled after we changed the playing media period.
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
+      listener.onAudioEnabled(eventTime, counters);
       listener.onDecoderEnabled(eventTime, C.TRACK_TYPE_AUDIO, counters);
     }
   }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public final void onAudioDecoderInitialized(
+      String decoderName, long initializedTimestampMs, long initializationDurationMs) {
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onAudioDecoderInitialized(eventTime, decoderName, initializationDurationMs);
+      listener.onDecoderInitialized(
+          eventTime, C.TRACK_TYPE_AUDIO, decoderName, initializationDurationMs);
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public final void onAudioInputFormatChanged(Format format) {
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onAudioInputFormatChanged(eventTime, format);
+      listener.onDecoderInputFormatChanged(eventTime, C.TRACK_TYPE_AUDIO, format);
+    }
+  }
+
+  @Override
+  public final void onAudioPositionAdvancing(long playoutStartSystemTimeMs) {
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onAudioPositionAdvancing(eventTime, playoutStartSystemTimeMs);
+    }
+  }
+
+  @Override
+  public final void onAudioUnderrun(
+      int bufferSize, long bufferSizeMs, long elapsedSinceLastFeedMs) {
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onAudioUnderrun(eventTime, bufferSize, bufferSizeMs, elapsedSinceLastFeedMs);
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public final void onAudioDisabled(DecoderCounters counters) {
+    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onAudioDisabled(eventTime, counters);
+      listener.onDecoderDisabled(eventTime, C.TRACK_TYPE_AUDIO, counters);
+    }
+  }
+
+  // AudioListener implementation.
 
   @Override
   public final void onAudioSessionId(int audioSessionId) {
@@ -214,77 +243,102 @@ public class AnalyticsCollector
   }
 
   @Override
-  public final void onAudioDecoderInitialized(
-      String decoderName, long initializedTimestampMs, long initializationDurationMs) {
+  public void onAudioAttributesChanged(AudioAttributes audioAttributes) {
     EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
-      listener.onDecoderInitialized(
-          eventTime, C.TRACK_TYPE_AUDIO, decoderName, initializationDurationMs);
+      listener.onAudioAttributesChanged(eventTime, audioAttributes);
     }
   }
 
   @Override
-  public final void onAudioInputFormatChanged(Format format) {
+  public void onSkipSilenceEnabledChanged(boolean skipSilenceEnabled) {
     EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
-      listener.onDecoderInputFormatChanged(eventTime, C.TRACK_TYPE_AUDIO, format);
+      listener.onSkipSilenceEnabledChanged(eventTime, skipSilenceEnabled);
     }
   }
 
   @Override
-  public final void onAudioSinkUnderrun(
-      int bufferSize, long bufferSizeMs, long elapsedSinceLastFeedMs) {
+  public void onVolumeChanged(float audioVolume) {
     EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
-      listener.onAudioUnderrun(eventTime, bufferSize, bufferSizeMs, elapsedSinceLastFeedMs);
-    }
-  }
-
-  @Override
-  public final void onAudioDisabled(DecoderCounters counters) {
-    // The renderers are disabled after we changed the playing media period on the playback thread
-    // but before this change is reported to the app thread.
-    EventTime eventTime = generateLastReportedPlayingMediaPeriodEventTime();
-    for (AnalyticsListener listener : listeners) {
-      listener.onDecoderDisabled(eventTime, C.TRACK_TYPE_AUDIO, counters);
+      listener.onVolumeChanged(eventTime, audioVolume);
     }
   }
 
   // VideoRendererEventListener implementation.
 
+  @SuppressWarnings("deprecation")
   @Override
   public final void onVideoEnabled(DecoderCounters counters) {
-    // The renderers are only enabled after we changed the playing media period.
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
+      listener.onVideoEnabled(eventTime, counters);
       listener.onDecoderEnabled(eventTime, C.TRACK_TYPE_VIDEO, counters);
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Override
   public final void onVideoDecoderInitialized(
       String decoderName, long initializedTimestampMs, long initializationDurationMs) {
     EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
+      listener.onVideoDecoderInitialized(eventTime, decoderName, initializationDurationMs);
       listener.onDecoderInitialized(
           eventTime, C.TRACK_TYPE_VIDEO, decoderName, initializationDurationMs);
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Override
   public final void onVideoInputFormatChanged(Format format) {
     EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
+      listener.onVideoInputFormatChanged(eventTime, format);
       listener.onDecoderInputFormatChanged(eventTime, C.TRACK_TYPE_VIDEO, format);
     }
   }
 
   @Override
   public final void onDroppedFrames(int count, long elapsedMs) {
-    EventTime eventTime = generateLastReportedPlayingMediaPeriodEventTime();
+    EventTime eventTime = generatePlayingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onDroppedVideoFrames(eventTime, count, elapsedMs);
     }
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public final void onVideoDisabled(DecoderCounters counters) {
+    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onVideoDisabled(eventTime, counters);
+      listener.onDecoderDisabled(eventTime, C.TRACK_TYPE_VIDEO, counters);
+    }
+  }
+
+  @Override
+  public final void onRenderedFirstFrame(@Nullable Surface surface) {
+    EventTime eventTime = generateReadingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onRenderedFirstFrame(eventTime, surface);
+    }
+  }
+
+  @Override
+  public final void onVideoFrameProcessingOffset(long totalProcessingOffsetUs, int frameCount) {
+    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onVideoFrameProcessingOffset(eventTime, totalProcessingOffsetUs, frameCount);
+    }
+  }
+
+  // VideoListener implementation.
+
+  @Override
+  public final void onRenderedFirstFrame() {
+    // Do nothing. Already reported in VideoRendererEventListener.onRenderedFirstFrame.
   }
 
   @Override
@@ -298,42 +352,14 @@ public class AnalyticsCollector
   }
 
   @Override
-  public final void onRenderedFirstFrame(Surface surface) {
+  public void onSurfaceSizeChanged(int width, int height) {
     EventTime eventTime = generateReadingMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
-      listener.onRenderedFirstFrame(eventTime, surface);
-    }
-  }
-
-  @Override
-  public final void onVideoDisabled(DecoderCounters counters) {
-    // The renderers are disabled after we changed the playing media period on the playback thread
-    // but before this change is reported to the app thread.
-    EventTime eventTime = generateLastReportedPlayingMediaPeriodEventTime();
-    for (AnalyticsListener listener : listeners) {
-      listener.onDecoderDisabled(eventTime, C.TRACK_TYPE_VIDEO, counters);
+      listener.onSurfaceSizeChanged(eventTime, width, height);
     }
   }
 
   // MediaSourceEventListener implementation.
-
-  @Override
-  public final void onMediaPeriodCreated(int windowIndex, MediaPeriodId mediaPeriodId) {
-    mediaPeriodQueueTracker.onMediaPeriodCreated(windowIndex, mediaPeriodId);
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
-    for (AnalyticsListener listener : listeners) {
-      listener.onMediaPeriodCreated(eventTime);
-    }
-  }
-
-  @Override
-  public final void onMediaPeriodReleased(int windowIndex, MediaPeriodId mediaPeriodId) {
-    mediaPeriodQueueTracker.onMediaPeriodReleased(windowIndex, mediaPeriodId);
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
-    for (AnalyticsListener listener : listeners) {
-      listener.onMediaPeriodReleased(eventTime);
-    }
-  }
 
   @Override
   public final void onLoadStarted(
@@ -341,7 +367,7 @@ public class AnalyticsCollector
       @Nullable MediaPeriodId mediaPeriodId,
       LoadEventInfo loadEventInfo,
       MediaLoadData mediaLoadData) {
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onLoadStarted(eventTime, loadEventInfo, mediaLoadData);
     }
@@ -353,7 +379,7 @@ public class AnalyticsCollector
       @Nullable MediaPeriodId mediaPeriodId,
       LoadEventInfo loadEventInfo,
       MediaLoadData mediaLoadData) {
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onLoadCompleted(eventTime, loadEventInfo, mediaLoadData);
     }
@@ -365,7 +391,7 @@ public class AnalyticsCollector
       @Nullable MediaPeriodId mediaPeriodId,
       LoadEventInfo loadEventInfo,
       MediaLoadData mediaLoadData) {
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onLoadCanceled(eventTime, loadEventInfo, mediaLoadData);
     }
@@ -379,25 +405,16 @@ public class AnalyticsCollector
       MediaLoadData mediaLoadData,
       IOException error,
       boolean wasCanceled) {
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onLoadError(eventTime, loadEventInfo, mediaLoadData, error, wasCanceled);
     }
   }
 
   @Override
-  public final void onReadingStarted(int windowIndex, MediaPeriodId mediaPeriodId) {
-    mediaPeriodQueueTracker.onReadingStarted(windowIndex, mediaPeriodId);
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
-    for (AnalyticsListener listener : listeners) {
-      listener.onReadingStarted(eventTime);
-    }
-  }
-
-  @Override
   public final void onUpstreamDiscarded(
       int windowIndex, @Nullable MediaPeriodId mediaPeriodId, MediaLoadData mediaLoadData) {
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onUpstreamDiscarded(eventTime, mediaLoadData);
     }
@@ -406,7 +423,7 @@ public class AnalyticsCollector
   @Override
   public final void onDownstreamFormatChanged(
       int windowIndex, @Nullable MediaPeriodId mediaPeriodId, MediaLoadData mediaLoadData) {
-    EventTime eventTime = generateEventTime(windowIndex, mediaPeriodId);
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onDownstreamFormatChanged(eventTime, mediaLoadData);
     }
@@ -419,43 +436,86 @@ public class AnalyticsCollector
   // having slightly different real times.
 
   @Override
-  public final void onTimelineChanged(
-      Timeline timeline, @Nullable Object manifest, @Player.TimelineChangeReason int reason) {
-    mediaPeriodQueueTracker.onTimelineChanged(timeline);
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+  public final void onTimelineChanged(Timeline timeline, @Player.TimelineChangeReason int reason) {
+    mediaPeriodQueueTracker.onTimelineChanged(checkNotNull(player));
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onTimelineChanged(eventTime, reason);
     }
   }
 
   @Override
+  public final void onMediaItemTransition(
+      @Nullable MediaItem mediaItem, @Player.MediaItemTransitionReason int reason) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onMediaItemTransition(eventTime, mediaItem, reason);
+    }
+  }
+
+  @Override
   public final void onTracksChanged(
       TrackGroupArray trackGroups, TrackSelectionArray trackSelections) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onTracksChanged(eventTime, trackGroups, trackSelections);
     }
   }
 
   @Override
-  public final void onLoadingChanged(boolean isLoading) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+  public final void onIsLoadingChanged(boolean isLoading) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
-      listener.onLoadingChanged(eventTime, isLoading);
+      listener.onIsLoadingChanged(eventTime, isLoading);
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Override
-  public final void onPlayerStateChanged(boolean playWhenReady, int playbackState) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+  public final void onPlayerStateChanged(boolean playWhenReady, @Player.State int playbackState) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onPlayerStateChanged(eventTime, playWhenReady, playbackState);
     }
   }
 
   @Override
+  public final void onPlaybackStateChanged(@Player.State int state) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onPlaybackStateChanged(eventTime, state);
+    }
+  }
+
+  @Override
+  public final void onPlayWhenReadyChanged(
+      boolean playWhenReady, @Player.PlayWhenReadyChangeReason int reason) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onPlayWhenReadyChanged(eventTime, playWhenReady, reason);
+    }
+  }
+
+  @Override
+  public void onPlaybackSuppressionReasonChanged(
+      @PlaybackSuppressionReason int playbackSuppressionReason) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onPlaybackSuppressionReasonChanged(eventTime, playbackSuppressionReason);
+    }
+  }
+
+  @Override
+  public void onIsPlayingChanged(boolean isPlaying) {
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onIsPlayingChanged(eventTime, isPlaying);
+    }
+  }
+
+  @Override
   public final void onRepeatModeChanged(@Player.RepeatMode int repeatMode) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onRepeatModeChanged(eventTime, repeatMode);
     }
@@ -463,7 +523,7 @@ public class AnalyticsCollector
 
   @Override
   public final void onShuffleModeEnabledChanged(boolean shuffleModeEnabled) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onShuffleModeChanged(eventTime, shuffleModeEnabled);
     }
@@ -471,7 +531,10 @@ public class AnalyticsCollector
 
   @Override
   public final void onPlayerError(ExoPlaybackException error) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime =
+        error.mediaPeriodId != null
+            ? generateEventTime(error.mediaPeriodId)
+            : generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onPlayerError(eventTime, error);
     }
@@ -479,8 +542,11 @@ public class AnalyticsCollector
 
   @Override
   public final void onPositionDiscontinuity(@Player.DiscontinuityReason int reason) {
-    mediaPeriodQueueTracker.onPositionDiscontinuity(reason);
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+      isSeeking = false;
+    }
+    mediaPeriodQueueTracker.onPositionDiscontinuity(checkNotNull(player));
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onPositionDiscontinuity(eventTime, reason);
     }
@@ -488,20 +554,18 @@ public class AnalyticsCollector
 
   @Override
   public final void onPlaybackParametersChanged(PlaybackParameters playbackParameters) {
-    EventTime eventTime = generatePlayingMediaPeriodEventTime();
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
     for (AnalyticsListener listener : listeners) {
       listener.onPlaybackParametersChanged(eventTime, playbackParameters);
     }
   }
 
+  @SuppressWarnings("deprecation")
   @Override
   public final void onSeekProcessed() {
-    if (mediaPeriodQueueTracker.isSeeking()) {
-      mediaPeriodQueueTracker.onSeekProcessed();
-      EventTime eventTime = generatePlayingMediaPeriodEventTime();
-      for (AnalyticsListener listener : listeners) {
-        listener.onSeekProcessed(eventTime);
-      }
+    EventTime eventTime = generateCurrentPlayerMediaPeriodEventTime();
+    for (AnalyticsListener listener : listeners) {
+      listener.onSeekProcessed(eventTime);
     }
   }
 
@@ -518,94 +582,120 @@ public class AnalyticsCollector
   // DefaultDrmSessionManager.EventListener implementation.
 
   @Override
-  public final void onDrmKeysLoaded() {
-    EventTime eventTime = generateReadingMediaPeriodEventTime();
+  public final void onDrmSessionAcquired(int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
+    for (AnalyticsListener listener : listeners) {
+      listener.onDrmSessionAcquired(eventTime);
+    }
+  }
+
+  @Override
+  public final void onDrmKeysLoaded(int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onDrmKeysLoaded(eventTime);
     }
   }
 
   @Override
-  public final void onDrmSessionManagerError(Exception error) {
-    EventTime eventTime = generateReadingMediaPeriodEventTime();
+  public final void onDrmSessionManagerError(
+      int windowIndex, @Nullable MediaPeriodId mediaPeriodId, Exception error) {
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onDrmSessionManagerError(eventTime, error);
     }
   }
 
   @Override
-  public final void onDrmKeysRestored() {
-    EventTime eventTime = generateReadingMediaPeriodEventTime();
+  public final void onDrmKeysRestored(int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onDrmKeysRestored(eventTime);
     }
   }
 
   @Override
-  public final void onDrmKeysRemoved() {
-    EventTime eventTime = generateReadingMediaPeriodEventTime();
+  public final void onDrmKeysRemoved(int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
     for (AnalyticsListener listener : listeners) {
       listener.onDrmKeysRemoved(eventTime);
     }
   }
 
-  // Internal methods.
-
-  /** Returns read-only set of registered listeners. */
-  protected Set<AnalyticsListener> getListeners() {
-    return Collections.unmodifiableSet(listeners);
+  @Override
+  public final void onDrmSessionReleased(int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    EventTime eventTime = generateMediaPeriodEventTime(windowIndex, mediaPeriodId);
+    for (AnalyticsListener listener : listeners) {
+      listener.onDrmSessionReleased(eventTime);
+    }
   }
 
-  /** Returns a new {@link EventTime} for the specified window index and media period id. */
-  protected EventTime generateEventTime(int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
-    Assertions.checkNotNull(player);
-    long realtimeMs = clock.elapsedRealtime();
-    Timeline timeline = player.getCurrentTimeline();
-    long eventPositionMs;
-    if (windowIndex == player.getCurrentWindowIndex()) {
-      if (mediaPeriodId != null && mediaPeriodId.isAd()) {
-        // This event is for an ad in the currently playing window.
-        eventPositionMs =
-            player.getCurrentAdGroupIndex() == mediaPeriodId.adGroupIndex
-                    && player.getCurrentAdIndexInAdGroup() == mediaPeriodId.adIndexInAdGroup
-                ? player.getCurrentPosition()
-                : 0 /* Assume start position of 0 for a future ad. */;
-      } else {
-        // This event is for content in the currently playing window.
-        eventPositionMs = player.getContentPosition();
-      }
-    } else if (windowIndex >= timeline.getWindowCount()
-        || (mediaPeriodId != null && mediaPeriodId.isAd())) {
-      // This event is for an unknown future window or for an ad in a future window.
-      // Assume start position of zero.
-      eventPositionMs = 0;
-    } else {
-      // This event is for content in a future window. Assume default start position.
-      eventPositionMs = timeline.getWindow(windowIndex, window).getDefaultPositionMs();
+  // Internal methods.
+
+
+  /** Returns a new {@link EventTime} for the specified timeline, window and media period id. */
+  @RequiresNonNull("player")
+  protected EventTime generateEventTime(
+      Timeline timeline, int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    if (timeline.isEmpty()) {
+      // Ensure media period id is only reported together with a valid timeline.
+      mediaPeriodId = null;
     }
-    // TODO(b/30792113): implement this properly (player.getTotalBufferedDuration()).
-    long bufferedDurationMs = player.getBufferedPosition() - player.getContentPosition();
+    long realtimeMs = clock.elapsedRealtime();
+    long eventPositionMs;
+    boolean isInCurrentWindow =
+        timeline.equals(player.getCurrentTimeline())
+            && windowIndex == player.getCurrentWindowIndex();
+    if (mediaPeriodId != null && mediaPeriodId.isAd()) {
+      boolean isCurrentAd =
+          isInCurrentWindow
+              && player.getCurrentAdGroupIndex() == mediaPeriodId.adGroupIndex
+              && player.getCurrentAdIndexInAdGroup() == mediaPeriodId.adIndexInAdGroup;
+      // Assume start position of 0 for future ads.
+      eventPositionMs = isCurrentAd ? player.getCurrentPosition() : 0;
+    } else if (isInCurrentWindow) {
+      eventPositionMs = player.getContentPosition();
+    } else {
+      // Assume default start position for future content windows. If timeline is not available yet,
+      // assume start position of 0.
+      eventPositionMs =
+          timeline.isEmpty() ? 0 : timeline.getWindow(windowIndex, window).getDefaultPositionMs();
+    }
+    @Nullable
+    MediaPeriodId currentMediaPeriodId = mediaPeriodQueueTracker.getCurrentPlayerMediaPeriod();
     return new EventTime(
         realtimeMs,
         timeline,
         windowIndex,
         mediaPeriodId,
         eventPositionMs,
+        player.getCurrentTimeline(),
+        player.getCurrentWindowIndex(),
+        currentMediaPeriodId,
         player.getCurrentPosition(),
-        bufferedDurationMs);
+        player.getTotalBufferedDuration());
   }
 
-  private EventTime generateEventTime(@Nullable WindowAndMediaPeriodId mediaPeriod) {
-    if (mediaPeriod == null) {
-      int windowIndex = Assertions.checkNotNull(player).getCurrentWindowIndex();
-      MediaPeriodId mediaPeriodId = mediaPeriodQueueTracker.tryResolveWindowIndex(windowIndex);
-      return generateEventTime(windowIndex, mediaPeriodId);
+  private EventTime generateEventTime(@Nullable MediaPeriodId mediaPeriodId) {
+    checkNotNull(player);
+    @Nullable
+    Timeline knownTimeline =
+        mediaPeriodId == null
+            ? null
+            : mediaPeriodQueueTracker.getMediaPeriodIdTimeline(mediaPeriodId);
+    if (mediaPeriodId == null || knownTimeline == null) {
+      int windowIndex = player.getCurrentWindowIndex();
+      Timeline timeline = player.getCurrentTimeline();
+      boolean windowIsInTimeline = windowIndex < timeline.getWindowCount();
+      return generateEventTime(
+          windowIsInTimeline ? timeline : Timeline.EMPTY, windowIndex, /* mediaPeriodId= */ null);
     }
-    return generateEventTime(mediaPeriod.windowIndex, mediaPeriod.mediaPeriodId);
+    int windowIndex = knownTimeline.getPeriodByUid(mediaPeriodId.periodUid, period).windowIndex;
+    return generateEventTime(knownTimeline, windowIndex, mediaPeriodId);
   }
 
-  private EventTime generateLastReportedPlayingMediaPeriodEventTime() {
-    return generateEventTime(mediaPeriodQueueTracker.getLastReportedPlayingMediaPeriod());
+  private EventTime generateCurrentPlayerMediaPeriodEventTime() {
+    return generateEventTime(mediaPeriodQueueTracker.getCurrentPlayerMediaPeriod());
   }
 
   private EventTime generatePlayingMediaPeriodEventTime() {
@@ -620,197 +710,223 @@ public class AnalyticsCollector
     return generateEventTime(mediaPeriodQueueTracker.getLoadingMediaPeriod());
   }
 
+  private EventTime generateMediaPeriodEventTime(
+      int windowIndex, @Nullable MediaPeriodId mediaPeriodId) {
+    checkNotNull(player);
+    if (mediaPeriodId != null) {
+      boolean isInKnownTimeline =
+          mediaPeriodQueueTracker.getMediaPeriodIdTimeline(mediaPeriodId) != null;
+      return isInKnownTimeline
+          ? generateEventTime(mediaPeriodId)
+          : generateEventTime(Timeline.EMPTY, windowIndex, mediaPeriodId);
+    }
+    Timeline timeline = player.getCurrentTimeline();
+    boolean windowIsInTimeline = windowIndex < timeline.getWindowCount();
+    return generateEventTime(
+        windowIsInTimeline ? timeline : Timeline.EMPTY, windowIndex, /* mediaPeriodId= */ null);
+  }
+
   /** Keeps track of the active media periods and currently playing and reading media period. */
   private static final class MediaPeriodQueueTracker {
 
-    // TODO: Investigate reporting MediaPeriodId in renderer events and adding a listener of queue
-    // changes, which would hopefully remove the need to track the queue here.
+    // TODO: Investigate reporting MediaPeriodId in renderer events.
 
-    private final ArrayList<WindowAndMediaPeriodId> activeMediaPeriods;
     private final Period period;
 
-    private WindowAndMediaPeriodId lastReportedPlayingMediaPeriod;
-    private WindowAndMediaPeriodId readingMediaPeriod;
-    private Timeline timeline;
-    private boolean isSeeking;
+    private ImmutableList<MediaPeriodId> mediaPeriodQueue;
+    private ImmutableMap<MediaPeriodId, Timeline> mediaPeriodTimelines;
+    @Nullable private MediaPeriodId currentPlayerMediaPeriod;
+    private @MonotonicNonNull MediaPeriodId playingMediaPeriod;
+    private @MonotonicNonNull MediaPeriodId readingMediaPeriod;
 
-    public MediaPeriodQueueTracker() {
-      activeMediaPeriods = new ArrayList<>();
-      period = new Period();
-      timeline = Timeline.EMPTY;
+    public MediaPeriodQueueTracker(Period period) {
+      this.period = period;
+      mediaPeriodQueue = ImmutableList.of();
+      mediaPeriodTimelines = ImmutableMap.of();
     }
 
     /**
-     * Returns the {@link WindowAndMediaPeriodId} of the media period in the front of the queue.
-     * This is the playing media period unless the player hasn't started playing yet (in which case
-     * it is the loading media period or null). While the player is seeking or preparing, this
-     * method will always return null to reflect the uncertainty about the current playing period.
-     * May also be null, if the timeline is empty or no media period is active yet.
+     * Returns the {@link MediaPeriodId} of the media period corresponding the current position of
+     * the player.
+     *
+     * <p>May be null if no matching media period has been created yet.
      */
-    public @Nullable WindowAndMediaPeriodId getPlayingMediaPeriod() {
-      return activeMediaPeriods.isEmpty() || timeline.isEmpty() || isSeeking
-          ? null
-          : activeMediaPeriods.get(0);
+    @Nullable
+    public MediaPeriodId getCurrentPlayerMediaPeriod() {
+      return currentPlayerMediaPeriod;
     }
 
     /**
-     * Returns the {@link WindowAndMediaPeriodId} of the currently playing media period. This is the
-     * publicly reported period which should always match {@link Player#getCurrentPeriodIndex()}
-     * unless the player is currently seeking or being prepared in which case the previous period is
-     * reported until the seek or preparation is processed. May be null, if no media period is
-     * active yet.
+     * Returns the {@link MediaPeriodId} of the media period at the front of the queue. If the queue
+     * is empty, this is the last media period which was at the front of the queue.
+     *
+     * <p>May be null, if no media period has been created yet.
      */
-    public @Nullable WindowAndMediaPeriodId getLastReportedPlayingMediaPeriod() {
-      return lastReportedPlayingMediaPeriod;
+    @Nullable
+    public MediaPeriodId getPlayingMediaPeriod() {
+      return playingMediaPeriod;
     }
 
     /**
-     * Returns the {@link WindowAndMediaPeriodId} of the media period currently being read by the
-     * player. May be null, if the player is not reading a media period.
+     * Returns the {@link MediaPeriodId} of the media period currently being read by the player. If
+     * the queue is empty, this is the last media period which was read by the player.
+     *
+     * <p>May be null, if no media period has been created yet.
      */
-    public @Nullable WindowAndMediaPeriodId getReadingMediaPeriod() {
+    @Nullable
+    public MediaPeriodId getReadingMediaPeriod() {
       return readingMediaPeriod;
     }
 
     /**
      * Returns the {@link MediaPeriodId} of the media period at the end of the queue which is
-     * currently loading or will be the next one loading. May be null, if no media period is active
-     * yet.
+     * currently loading or will be the next one loading.
+     *
+     * <p>May be null, if no media period is active yet.
      */
-    public @Nullable WindowAndMediaPeriodId getLoadingMediaPeriod() {
-      return activeMediaPeriods.isEmpty()
-          ? null
-          : activeMediaPeriods.get(activeMediaPeriods.size() - 1);
-    }
-
-    /** Returns whether the player is currently seeking. */
-    public boolean isSeeking() {
-      return isSeeking;
+    @Nullable
+    public MediaPeriodId getLoadingMediaPeriod() {
+      return mediaPeriodQueue.isEmpty() ? null : Iterables.getLast(mediaPeriodQueue);
     }
 
     /**
-     * Tries to find an existing media period id from the specified window index. Only returns a
-     * non-null media period id if there is a unique, unambiguous match.
+     * Returns the most recent {@link Timeline} for the given {@link MediaPeriodId}, or null if no
+     * timeline is available.
      */
-    public @Nullable MediaPeriodId tryResolveWindowIndex(int windowIndex) {
-      MediaPeriodId match = null;
-      if (timeline != null) {
-        int timelinePeriodCount = timeline.getPeriodCount();
-        for (int i = 0; i < activeMediaPeriods.size(); i++) {
-          WindowAndMediaPeriodId mediaPeriod = activeMediaPeriods.get(i);
-          int periodIndex = mediaPeriod.mediaPeriodId.periodIndex;
-          if (periodIndex < timelinePeriodCount
-              && timeline.getPeriod(periodIndex, period).windowIndex == windowIndex) {
-            if (match != null) {
-              // Ambiguous match.
-              return null;
-            }
-            match = mediaPeriod.mediaPeriodId;
-          }
+    @Nullable
+    public Timeline getMediaPeriodIdTimeline(MediaPeriodId mediaPeriodId) {
+      return mediaPeriodTimelines.get(mediaPeriodId);
+    }
+
+    /** Updates the queue tracker with a reported position discontinuity. */
+    public void onPositionDiscontinuity(Player player) {
+      currentPlayerMediaPeriod =
+          findCurrentPlayerMediaPeriodInQueue(player, mediaPeriodQueue, playingMediaPeriod, period);
+    }
+
+    /** Updates the queue tracker with a reported timeline change. */
+    public void onTimelineChanged(Player player) {
+      currentPlayerMediaPeriod =
+          findCurrentPlayerMediaPeriodInQueue(player, mediaPeriodQueue, playingMediaPeriod, period);
+      updateMediaPeriodTimelines(/* preferredTimeline= */ player.getCurrentTimeline());
+    }
+
+    /** Updates the queue tracker to a new queue of media periods. */
+    public void onQueueUpdated(
+        List<MediaPeriodId> queue, @Nullable MediaPeriodId readingPeriod, Player player) {
+      mediaPeriodQueue = ImmutableList.copyOf(queue);
+      if (!queue.isEmpty()) {
+        playingMediaPeriod = queue.get(0);
+        readingMediaPeriod = checkNotNull(readingPeriod);
+      }
+      if (currentPlayerMediaPeriod == null) {
+        currentPlayerMediaPeriod =
+            findCurrentPlayerMediaPeriodInQueue(
+                player, mediaPeriodQueue, playingMediaPeriod, period);
+      }
+      updateMediaPeriodTimelines(/* preferredTimeline= */ player.getCurrentTimeline());
+    }
+
+    private void updateMediaPeriodTimelines(Timeline preferredTimeline) {
+      ImmutableMap.Builder<MediaPeriodId, Timeline> builder = ImmutableMap.builder();
+      if (mediaPeriodQueue.isEmpty()) {
+        addTimelineForMediaPeriodId(builder, playingMediaPeriod, preferredTimeline);
+        if (!Objects.equal(readingMediaPeriod, playingMediaPeriod)) {
+          addTimelineForMediaPeriodId(builder, readingMediaPeriod, preferredTimeline);
+        }
+        if (!Objects.equal(currentPlayerMediaPeriod, playingMediaPeriod)
+            && !Objects.equal(currentPlayerMediaPeriod, readingMediaPeriod)) {
+          addTimelineForMediaPeriodId(builder, currentPlayerMediaPeriod, preferredTimeline);
+        }
+      } else {
+        for (int i = 0; i < mediaPeriodQueue.size(); i++) {
+          addTimelineForMediaPeriodId(builder, mediaPeriodQueue.get(i), preferredTimeline);
+        }
+        if (!mediaPeriodQueue.contains(currentPlayerMediaPeriod)) {
+          addTimelineForMediaPeriodId(builder, currentPlayerMediaPeriod, preferredTimeline);
         }
       }
-      return match;
+      mediaPeriodTimelines = builder.build();
     }
 
-    /** Updates the queue with a reported position discontinuity . */
-    public void onPositionDiscontinuity(@Player.DiscontinuityReason int reason) {
-      updateLastReportedPlayingMediaPeriod();
-    }
-
-    /** Updates the queue with a reported timeline change. */
-    public void onTimelineChanged(Timeline timeline) {
-      for (int i = 0; i < activeMediaPeriods.size(); i++) {
-        activeMediaPeriods.set(
-            i, updateMediaPeriodToNewTimeline(activeMediaPeriods.get(i), timeline));
+    private void addTimelineForMediaPeriodId(
+        ImmutableMap.Builder<MediaPeriodId, Timeline> mediaPeriodTimelinesBuilder,
+        @Nullable MediaPeriodId mediaPeriodId,
+        Timeline preferredTimeline) {
+      if (mediaPeriodId == null) {
+        return;
       }
-      if (readingMediaPeriod != null) {
-        readingMediaPeriod = updateMediaPeriodToNewTimeline(readingMediaPeriod, timeline);
-      }
-      this.timeline = timeline;
-      updateLastReportedPlayingMediaPeriod();
-    }
-
-    /** Updates the queue with a reported start of seek. */
-    public void onSeekStarted() {
-      isSeeking = true;
-    }
-
-    /** Updates the queue with a reported processed seek. */
-    public void onSeekProcessed() {
-      isSeeking = false;
-      updateLastReportedPlayingMediaPeriod();
-    }
-
-    /** Updates the queue with a newly created media period. */
-    public void onMediaPeriodCreated(int windowIndex, MediaPeriodId mediaPeriodId) {
-      activeMediaPeriods.add(new WindowAndMediaPeriodId(windowIndex, mediaPeriodId));
-      if (activeMediaPeriods.size() == 1 && !timeline.isEmpty()) {
-        updateLastReportedPlayingMediaPeriod();
+      if (preferredTimeline.getIndexOfPeriod(mediaPeriodId.periodUid) != C.INDEX_UNSET) {
+        mediaPeriodTimelinesBuilder.put(mediaPeriodId, preferredTimeline);
+      } else {
+        @Nullable Timeline existingTimeline = mediaPeriodTimelines.get(mediaPeriodId);
+        if (existingTimeline != null) {
+          mediaPeriodTimelinesBuilder.put(mediaPeriodId, existingTimeline);
+        }
       }
     }
 
-    /** Updates the queue with a released media period. */
-    public void onMediaPeriodReleased(int windowIndex, MediaPeriodId mediaPeriodId) {
-      WindowAndMediaPeriodId mediaPeriod = new WindowAndMediaPeriodId(windowIndex, mediaPeriodId);
-      activeMediaPeriods.remove(mediaPeriod);
-      if (mediaPeriod.equals(readingMediaPeriod)) {
-        readingMediaPeriod = activeMediaPeriods.isEmpty() ? null : activeMediaPeriods.get(0);
+    @Nullable
+    private static MediaPeriodId findCurrentPlayerMediaPeriodInQueue(
+        Player player,
+        ImmutableList<MediaPeriodId> mediaPeriodQueue,
+        @Nullable MediaPeriodId playingMediaPeriod,
+        Period period) {
+      Timeline playerTimeline = player.getCurrentTimeline();
+      int playerPeriodIndex = player.getCurrentPeriodIndex();
+      @Nullable
+      Object playerPeriodUid =
+          playerTimeline.isEmpty() ? null : playerTimeline.getUidOfPeriod(playerPeriodIndex);
+      int playerNextAdGroupIndex =
+          player.isPlayingAd() || playerTimeline.isEmpty()
+              ? C.INDEX_UNSET
+              : playerTimeline
+                  .getPeriod(playerPeriodIndex, period)
+                  .getAdGroupIndexAfterPositionUs(
+                      C.msToUs(player.getCurrentPosition()) - period.getPositionInWindowUs());
+      for (int i = 0; i < mediaPeriodQueue.size(); i++) {
+        MediaPeriodId mediaPeriodId = mediaPeriodQueue.get(i);
+        if (isMatchingMediaPeriod(
+            mediaPeriodId,
+            playerPeriodUid,
+            player.isPlayingAd(),
+            player.getCurrentAdGroupIndex(),
+            player.getCurrentAdIndexInAdGroup(),
+            playerNextAdGroupIndex)) {
+          return mediaPeriodId;
+        }
       }
+      if (mediaPeriodQueue.isEmpty() && playingMediaPeriod != null) {
+        if (isMatchingMediaPeriod(
+            playingMediaPeriod,
+            playerPeriodUid,
+            player.isPlayingAd(),
+            player.getCurrentAdGroupIndex(),
+            player.getCurrentAdIndexInAdGroup(),
+            playerNextAdGroupIndex)) {
+          return playingMediaPeriod;
+        }
+      }
+      return null;
     }
 
-    /** Update the queue with a change in the reading media period. */
-    public void onReadingStarted(int windowIndex, MediaPeriodId mediaPeriodId) {
-      readingMediaPeriod = new WindowAndMediaPeriodId(windowIndex, mediaPeriodId);
-    }
-
-    private void updateLastReportedPlayingMediaPeriod() {
-      if (!activeMediaPeriods.isEmpty()) {
-        lastReportedPlayingMediaPeriod = activeMediaPeriods.get(0);
-      }
-    }
-
-    private WindowAndMediaPeriodId updateMediaPeriodToNewTimeline(
-        WindowAndMediaPeriodId mediaPeriod, Timeline newTimeline) {
-      if (newTimeline.isEmpty() || timeline.isEmpty()) {
-        return mediaPeriod;
-      }
-      Object uid =
-          timeline.getPeriod(mediaPeriod.mediaPeriodId.periodIndex, period, /* setIds= */ true).uid;
-      int newPeriodIndex = newTimeline.getIndexOfPeriod(uid);
-      if (newPeriodIndex == C.INDEX_UNSET) {
-        return mediaPeriod;
-      }
-      int newWindowIndex = newTimeline.getPeriod(newPeriodIndex, period).windowIndex;
-      return new WindowAndMediaPeriodId(
-          newWindowIndex, mediaPeriod.mediaPeriodId.copyWithPeriodIndex(newPeriodIndex));
-    }
-  }
-
-  private static final class WindowAndMediaPeriodId {
-
-    public final int windowIndex;
-    public final MediaPeriodId mediaPeriodId;
-
-    public WindowAndMediaPeriodId(int windowIndex, MediaPeriodId mediaPeriodId) {
-      this.windowIndex = windowIndex;
-      this.mediaPeriodId = mediaPeriodId;
-    }
-
-    @Override
-    public boolean equals(@Nullable Object other) {
-      if (this == other) {
-        return true;
-      }
-      if (other == null || getClass() != other.getClass()) {
+    private static boolean isMatchingMediaPeriod(
+        MediaPeriodId mediaPeriodId,
+        @Nullable Object playerPeriodUid,
+        boolean isPlayingAd,
+        int playerAdGroupIndex,
+        int playerAdIndexInAdGroup,
+        int playerNextAdGroupIndex) {
+      if (!mediaPeriodId.periodUid.equals(playerPeriodUid)) {
         return false;
       }
-      WindowAndMediaPeriodId that = (WindowAndMediaPeriodId) other;
-      return windowIndex == that.windowIndex && mediaPeriodId.equals(that.mediaPeriodId);
-    }
-
-    @Override
-    public int hashCode() {
-      return 31 * windowIndex + mediaPeriodId.hashCode();
+      // Timeline period matches. Still need to check ad information.
+      return (isPlayingAd
+              && mediaPeriodId.adGroupIndex == playerAdGroupIndex
+              && mediaPeriodId.adIndexInAdGroup == playerAdIndexInAdGroup)
+          || (!isPlayingAd
+              && mediaPeriodId.adGroupIndex == C.INDEX_UNSET
+              && mediaPeriodId.nextAdGroupIndex == playerNextAdGroupIndex);
     }
   }
 }

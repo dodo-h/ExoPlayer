@@ -2,40 +2,29 @@
 
 The Cronet extension is an [HttpDataSource][] implementation using [Cronet][].
 
-[HttpDataSource]: https://google.github.io/ExoPlayer/doc/reference/com/google/android/exoplayer2/upstream/HttpDataSource.html
+[HttpDataSource]: https://exoplayer.dev/doc/reference/com/google/android/exoplayer2/upstream/HttpDataSource.html
 [Cronet]: https://chromium.googlesource.com/chromium/src/+/master/components/cronet?autodive=0%2F%2F
 
-## Build instructions ##
+## Getting the extension ##
 
-To use this extension you need to clone the ExoPlayer repository and depend on
-its modules locally. Instructions for doing this can be found in ExoPlayer's
-[top level README][]. In addition, it's necessary to get the Cronet libraries
-and enable the extension:
+The easiest way to use the extension is to add it as a gradle dependency:
 
-1. Find the latest Cronet release [here][] and navigate to its `Release/cronet`
-   directory
-1. Download `cronet_api.jar`, `cronet_impl_common_java.jar`,
-   `cronet_impl_native_java.jar` and the `libs` directory
-1. Copy the three jar files into the `libs` directory of this extension
-1. Copy the content of the downloaded `libs` directory into the `jniLibs`
-   directory of this extension
-1. In your `settings.gradle` file, add
-   `gradle.ext.exoplayerIncludeCronetExtension = true` before the line that
-   applies `core_settings.gradle`.
-1. In all `build.gradle` files where this extension is linked as a dependency,
-   add
-   ```
-   android {
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
-    }
-   }
-   ```
-   to enable Java 8 features required by the Cronet library.
+```gradle
+implementation 'com.google.android.exoplayer:extension-cronet:2.X.X'
+```
+
+where `2.X.X` is the version, which must match the version of the ExoPlayer
+library being used.
+
+Alternatively, you can clone the ExoPlayer repository and depend on the module
+locally. Instructions for doing this can be found in ExoPlayer's
+[top level README][].
+
+Note that by default, the extension will use the Cronet implementation in
+Google Play Services. If you prefer, it's also possible to embed the Cronet
+implementation directly into your application. See below for more details.
 
 [top level README]: https://github.com/google/ExoPlayer/blob/release-v2/README.md
-[here]: https://console.cloud.google.com/storage/browser/chromium-cronet/android
 
 ## Using the extension ##
 
@@ -62,9 +51,49 @@ new DefaultDataSourceFactory(
 ```
 respectively.
 
+## Choosing between Google Play Services Cronet and Cronet Embedded ##
+
+The underlying Cronet implementation is available both via a [Google Play
+Services](https://developers.google.com/android/guides/overview) API, and as a
+library that can be embedded directly into your application. When you depend on
+`com.google.android.exoplayer:extension-cronet:2.X.X`, the library will _not_ be
+embedded into your application by default. The extension will attempt to use the
+Cronet implementation in Google Play Services. The benefits of this approach
+are:
+
+* A negligible increase in the size of your application.
+* The Cronet implementation is updated automatically by Google Play Services.
+
+If Google Play Services is not available on a device, `CronetDataSourceFactory`
+will fall back to creating `DefaultHttpDataSource` instances, or
+`HttpDataSource` instances created by a `fallbackFactory` that you can specify.
+
+It's also possible to embed the Cronet implementation directly into your
+application. To do this, add an additional gradle dependency to the Cronet
+Embedded library:
+
+```gradle
+implementation 'com.google.android.exoplayer:extension-cronet:2.X.X'
+implementation 'org.chromium.net:cronet-embedded:XX.XXXX.XXX'
+```
+
+where `XX.XXXX.XXX` is the version of the library that you wish to use. The
+extension will automatically detect and use the library. Embedding will add
+approximately 8MB to your application, however it may be suitable if:
+
+* Your application is likely to be used in markets where Google Play Services is
+  not widely available.
+* You want to control the exact version of the Cronet implementation being used.
+
+If you do embed the library, you can specify which implementation should
+be preferred if the Google Play Services implementation is also available. This
+is controlled by a `preferGMSCoreCronet` parameter, which can be passed to the
+`CronetEngineWrapper` constructor (GMS Core is another name for Google Play
+Services).
+
 ## Links ##
 
 * [Javadoc][]: Classes matching `com.google.android.exoplayer2.ext.cronet.*`
   belong to this module.
 
-[Javadoc]: https://google.github.io/ExoPlayer/doc/reference/index.html
+[Javadoc]: https://exoplayer.dev/doc/reference/index.html

@@ -16,10 +16,13 @@
 package com.google.android.exoplayer2.metadata.scte35;
 
 import static com.google.android.exoplayer2.C.TIME_UNSET;
+import static com.google.android.exoplayer2.testutil.TestUtil.createByteArray;
+import static com.google.android.exoplayer2.testutil.TestUtil.createMetadataInputBuffer;
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
+import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.google.android.exoplayer2.metadata.Metadata;
-import com.google.android.exoplayer2.metadata.MetadataDecoderException;
 import com.google.android.exoplayer2.metadata.MetadataInputBuffer;
 import com.google.android.exoplayer2.util.TimestampAdjuster;
 import java.nio.ByteBuffer;
@@ -27,12 +30,9 @@ import java.util.List;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.robolectric.RobolectricTestRunner;
 
-/**
- * Test for {@link SpliceInfoDecoder}.
- */
-@RunWith(RobolectricTestRunner.class)
+/** Test for {@link SpliceInfoDecoder}. */
+@RunWith(AndroidJUnit4.class)
 public final class SpliceInfoDecoderTest {
 
   private SpliceInfoDecoder decoder;
@@ -45,7 +45,7 @@ public final class SpliceInfoDecoderTest {
   }
 
   @Test
-  public void testWrappedAroundTimeSignalCommand() throws MetadataDecoderException {
+  public void wrappedAroundTimeSignalCommand() {
     byte[] rawTimeSignalSection = new byte[] {
         0, // table_id.
         (byte) 0x80, // section_syntax_indicator, private_indicator, reserved, section_length(4).
@@ -72,7 +72,7 @@ public final class SpliceInfoDecoderTest {
   }
 
   @Test
-  public void test2SpliceInsertCommands() throws MetadataDecoderException {
+  public void test2SpliceInsertCommands() {
     byte[] rawSpliceInsertCommand1 = new byte[] {
         0, // table_id.
         (byte) 0x80, // section_syntax_indicator, private_indicator, reserved, section_length(4).
@@ -165,17 +165,43 @@ public final class SpliceInfoDecoderTest {
     assertThat(command.availsExpected).isEqualTo(2);
   }
 
-  private Metadata feedInputBuffer(byte[] data, long timeUs, long subsampleOffset)
-      throws MetadataDecoderException{
+  @Test
+  public void decodeFailsIfPositionNonZero() {
+    MetadataInputBuffer buffer = createMetadataInputBuffer(createByteArray(1, 2, 3));
+    buffer.data.position(1);
+
+    assertThrows(IllegalArgumentException.class, () -> decoder.decode(buffer));
+  }
+
+  @Test
+  public void decodeFailsIfBufferHasNoArray() {
+    MetadataInputBuffer buffer = createMetadataInputBuffer(createByteArray(1, 2, 3));
+    buffer.data = buffer.data.asReadOnlyBuffer();
+
+    assertThrows(IllegalArgumentException.class, () -> decoder.decode(buffer));
+  }
+
+  @Test
+  public void decodeFailsIfArrayOffsetNonZero() {
+    MetadataInputBuffer buffer = createMetadataInputBuffer(createByteArray(1, 2, 3));
+    buffer.data.position(1);
+    buffer.data = buffer.data.slice();
+
+    assertThrows(IllegalArgumentException.class, () -> decoder.decode(buffer));
+  }
+
+  private Metadata feedInputBuffer(byte[] data, long timeUs, long subsampleOffset) {
     inputBuffer.clear();
     inputBuffer.data = ByteBuffer.allocate(data.length).put(data);
+    inputBuffer.data.flip();
     inputBuffer.timeUs = timeUs;
     inputBuffer.subsampleOffsetUs = subsampleOffset;
     return decoder.decode(inputBuffer);
   }
 
   private static long removePtsConversionPrecisionError(long timeUs, long offsetUs) {
-    return TimestampAdjuster.ptsToUs(TimestampAdjuster.usToPts(timeUs - offsetUs)) + offsetUs;
+    return TimestampAdjuster.ptsToUs(TimestampAdjuster.usToNonWrappedPts(timeUs - offsetUs))
+        + offsetUs;
   }
 
 }

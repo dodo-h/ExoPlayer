@@ -17,37 +17,30 @@ package com.google.android.exoplayer2.source;
 
 import android.net.Uri;
 import android.os.Handler;
-import android.support.annotation.Nullable;
+import androidx.annotation.Nullable;
 import com.google.android.exoplayer2.C;
-import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.Player;
+import com.google.android.exoplayer2.Timeline;
+import com.google.android.exoplayer2.drm.DrmSessionManager;
 import com.google.android.exoplayer2.extractor.DefaultExtractorsFactory;
 import com.google.android.exoplayer2.extractor.Extractor;
 import com.google.android.exoplayer2.extractor.ExtractorsFactory;
-import com.google.android.exoplayer2.source.ads.AdsMediaSource;
 import com.google.android.exoplayer2.upstream.Allocator;
 import com.google.android.exoplayer2.upstream.DataSource;
+import com.google.android.exoplayer2.upstream.DefaultLoadErrorHandlingPolicy;
+import com.google.android.exoplayer2.upstream.HttpDataSource;
+import com.google.android.exoplayer2.upstream.LoadErrorHandlingPolicy;
+import com.google.android.exoplayer2.upstream.TransferListener;
 import com.google.android.exoplayer2.util.Assertions;
 import java.io.IOException;
 
-/**
- * Provides one period that loads data from a {@link Uri} and extracted using an {@link Extractor}.
- *
- * <p>If the possible input stream container formats are known, pass a factory that instantiates
- * extractors for them to the constructor. Otherwise, pass a {@link DefaultExtractorsFactory} to use
- * the default extractors. When reading a new stream, the first {@link Extractor} in the array of
- * extractors created by the factory that returns {@code true} from {@link Extractor#sniff} will be
- * used to extract samples from the input stream.
- *
- * <p>Note that the built-in extractors for AAC, MPEG PS/TS and FLV streams do not support seeking.
- */
-public final class ExtractorMediaSource extends BaseMediaSource
-    implements ExtractorMediaPeriod.Listener {
-  /**
-   * Listener of {@link ExtractorMediaSource} events.
-   *
-   * @deprecated Use {@link MediaSourceEventListener}.
-   */
+/** @deprecated Use {@link ProgressiveMediaSource} instead. */
+@Deprecated
+@SuppressWarnings("deprecation")
+public final class ExtractorMediaSource extends CompositeMediaSource<Void> {
+
+  /** @deprecated Use {@link MediaSourceEventListener} instead. */
   @Deprecated
   public interface EventListener {
 
@@ -67,51 +60,17 @@ public final class ExtractorMediaSource extends BaseMediaSource
 
   }
 
-  /**
-   * The default minimum number of times to retry loading prior to failing for on-demand streams.
-   */
-  public static final int DEFAULT_MIN_LOADABLE_RETRY_COUNT_ON_DEMAND = 3;
-
-  /**
-   * The default minimum number of times to retry loading prior to failing for live streams.
-   */
-  public static final int DEFAULT_MIN_LOADABLE_RETRY_COUNT_LIVE = 6;
-
-  /**
-   * Value for {@code minLoadableRetryCount} that causes the loader to retry
-   * {@link #DEFAULT_MIN_LOADABLE_RETRY_COUNT_LIVE} times for live streams and
-   * {@link #DEFAULT_MIN_LOADABLE_RETRY_COUNT_ON_DEMAND} for on-demand streams.
-   */
-  public static final int MIN_RETRY_COUNT_DEFAULT_FOR_MEDIA = -1;
-
-  /**
-   * The default number of bytes that should be loaded between each each invocation of
-   * {@link MediaPeriod.Callback#onContinueLoadingRequested(SequenceableLoader)}.
-   */
-  public static final int DEFAULT_LOADING_CHECK_INTERVAL_BYTES = 1024 * 1024;
-
-  private final Uri uri;
-  private final DataSource.Factory dataSourceFactory;
-  private final ExtractorsFactory extractorsFactory;
-  private final int minLoadableRetryCount;
-  private final String customCacheKey;
-  private final int continueLoadingCheckIntervalBytes;
-  private final @Nullable Object tag;
-
-  private long timelineDurationUs;
-  private boolean timelineIsSeekable;
-
-  /** Factory for {@link ExtractorMediaSource}s. */
-  public static final class Factory implements AdsMediaSource.MediaSourceFactory {
+  /** @deprecated Use {@link ProgressiveMediaSource.Factory} instead. */
+  @Deprecated
+  public static final class Factory implements MediaSourceFactory {
 
     private final DataSource.Factory dataSourceFactory;
 
-    private @Nullable ExtractorsFactory extractorsFactory;
-    private @Nullable String customCacheKey;
-    private @Nullable Object tag;
-    private int minLoadableRetryCount;
+    private ExtractorsFactory extractorsFactory;
+    private LoadErrorHandlingPolicy loadErrorHandlingPolicy;
     private int continueLoadingCheckIntervalBytes;
-    private boolean isCreateCalled;
+    @Nullable private String customCacheKey;
+    @Nullable private Object tag;
 
     /**
      * Creates a new factory for {@link ExtractorMediaSource}s.
@@ -120,7 +79,8 @@ public final class ExtractorMediaSource extends BaseMediaSource
      */
     public Factory(DataSource.Factory dataSourceFactory) {
       this.dataSourceFactory = dataSourceFactory;
-      minLoadableRetryCount = MIN_RETRY_COUNT_DEFAULT_FOR_MEDIA;
+      extractorsFactory = new DefaultExtractorsFactory();
+      loadErrorHandlingPolicy = new DefaultLoadErrorHandlingPolicy();
       continueLoadingCheckIntervalBytes = DEFAULT_LOADING_CHECK_INTERVAL_BYTES;
     }
 
@@ -132,11 +92,10 @@ public final class ExtractorMediaSource extends BaseMediaSource
      *     possible formats are known, pass a factory that instantiates extractors for those
      *     formats.
      * @return This factory, for convenience.
-     * @throws IllegalStateException If one of the {@code create} methods has already been called.
      */
-    public Factory setExtractorsFactory(ExtractorsFactory extractorsFactory) {
-      Assertions.checkState(!isCreateCalled);
-      this.extractorsFactory = extractorsFactory;
+    public Factory setExtractorsFactory(@Nullable ExtractorsFactory extractorsFactory) {
+      this.extractorsFactory =
+          extractorsFactory != null ? extractorsFactory : new DefaultExtractorsFactory();
       return this;
     }
 
@@ -147,40 +106,44 @@ public final class ExtractorMediaSource extends BaseMediaSource
      * @param customCacheKey A custom key that uniquely identifies the original stream. Used for
      *     cache indexing.
      * @return This factory, for convenience.
-     * @throws IllegalStateException If one of the {@code create} methods has already been called.
      */
-    public Factory setCustomCacheKey(String customCacheKey) {
-      Assertions.checkState(!isCreateCalled);
+    public Factory setCustomCacheKey(@Nullable String customCacheKey) {
       this.customCacheKey = customCacheKey;
       return this;
     }
 
     /**
-     * Sets a tag for the media source which will be published in the {@link
-     * com.google.android.exoplayer2.Timeline} of the source as {@link
-     * com.google.android.exoplayer2.Timeline.Window#tag}.
-     *
-     * @param tag A tag for the media source.
-     * @return This factory, for convenience.
-     * @throws IllegalStateException If one of the {@code create} methods has already been called.
+     * @deprecated Use {@link MediaItem.Builder#setTag(Object)} and {@link
+     *     #createMediaSource(MediaItem)} instead.
      */
-    public Factory setTag(Object tag) {
-      Assertions.checkState(!isCreateCalled);
+    @Deprecated
+    public Factory setTag(@Nullable Object tag) {
       this.tag = tag;
       return this;
     }
 
-    /**
-     * Sets the minimum number of times to retry if a loading error occurs. The default value is
-     * {@link #MIN_RETRY_COUNT_DEFAULT_FOR_MEDIA}.
-     *
-     * @param minLoadableRetryCount The minimum number of times to retry if a loading error occurs.
-     * @return This factory, for convenience.
-     * @throws IllegalStateException If one of the {@code create} methods has already been called.
-     */
+    /** @deprecated Use {@link #setLoadErrorHandlingPolicy(LoadErrorHandlingPolicy)} instead. */
+    @Deprecated
     public Factory setMinLoadableRetryCount(int minLoadableRetryCount) {
-      Assertions.checkState(!isCreateCalled);
-      this.minLoadableRetryCount = minLoadableRetryCount;
+      return setLoadErrorHandlingPolicy(new DefaultLoadErrorHandlingPolicy(minLoadableRetryCount));
+    }
+
+    /**
+     * Sets the {@link LoadErrorHandlingPolicy}. The default value is created by calling {@link
+     * DefaultLoadErrorHandlingPolicy#DefaultLoadErrorHandlingPolicy()}.
+     *
+     * <p>Calling this method overrides any calls to {@link #setMinLoadableRetryCount(int)}.
+     *
+     * @param loadErrorHandlingPolicy A {@link LoadErrorHandlingPolicy}.
+     * @return This factory, for convenience.
+     */
+    @Override
+    public Factory setLoadErrorHandlingPolicy(
+        @Nullable LoadErrorHandlingPolicy loadErrorHandlingPolicy) {
+      this.loadErrorHandlingPolicy =
+          loadErrorHandlingPolicy != null
+              ? loadErrorHandlingPolicy
+              : new DefaultLoadErrorHandlingPolicy();
       return this;
     }
 
@@ -193,38 +156,66 @@ public final class ExtractorMediaSource extends BaseMediaSource
      *     each invocation of {@link
      *     MediaPeriod.Callback#onContinueLoadingRequested(SequenceableLoader)}.
      * @return This factory, for convenience.
-     * @throws IllegalStateException If one of the {@code create} methods has already been called.
      */
     public Factory setContinueLoadingCheckIntervalBytes(int continueLoadingCheckIntervalBytes) {
-      Assertions.checkState(!isCreateCalled);
       this.continueLoadingCheckIntervalBytes = continueLoadingCheckIntervalBytes;
       return this;
+    }
+
+    /** @deprecated Use {@link ProgressiveMediaSource.Factory#setDrmSessionManager} instead. */
+    @Deprecated
+    @Override
+    public Factory setDrmSessionManager(@Nullable DrmSessionManager drmSessionManager) {
+      throw new UnsupportedOperationException();
+    }
+
+    /**
+     * @deprecated Use {@link ProgressiveMediaSource.Factory#setDrmHttpDataSourceFactory} instead.
+     */
+    @Deprecated
+    @Override
+    public MediaSourceFactory setDrmHttpDataSourceFactory(
+        @Nullable HttpDataSource.Factory drmHttpDataSourceFactory) {
+      throw new UnsupportedOperationException();
+    }
+
+    /** @deprecated Use {@link ProgressiveMediaSource.Factory#setDrmUserAgent} instead. */
+    @Deprecated
+    @Override
+    public MediaSourceFactory setDrmUserAgent(@Nullable String userAgent) {
+      throw new UnsupportedOperationException();
+    }
+
+    /** @deprecated Use {@link #createMediaSource(MediaItem)} instead. */
+    @SuppressWarnings("deprecation")
+    @Deprecated
+    @Override
+    public ExtractorMediaSource createMediaSource(Uri uri) {
+      return createMediaSource(new MediaItem.Builder().setUri(uri).build());
     }
 
     /**
      * Returns a new {@link ExtractorMediaSource} using the current parameters.
      *
-     * @param uri The {@link Uri}.
+     * @param mediaItem The {@link MediaItem}.
      * @return The new {@link ExtractorMediaSource}.
+     * @throws NullPointerException if {@link MediaItem#playbackProperties} is {@code null}.
      */
     @Override
-    public ExtractorMediaSource createMediaSource(Uri uri) {
-      isCreateCalled = true;
-      if (extractorsFactory == null) {
-        extractorsFactory = new DefaultExtractorsFactory();
-      }
+    public ExtractorMediaSource createMediaSource(MediaItem mediaItem) {
+      Assertions.checkNotNull(mediaItem.playbackProperties);
       return new ExtractorMediaSource(
-          uri,
+          mediaItem.playbackProperties.uri,
           dataSourceFactory,
           extractorsFactory,
-          minLoadableRetryCount,
+          loadErrorHandlingPolicy,
           customCacheKey,
           continueLoadingCheckIntervalBytes,
-          tag);
+          mediaItem.playbackProperties.tag != null ? mediaItem.playbackProperties.tag : tag);
     }
 
     /**
-     * @deprecated Use {@link #createMediaSource(Uri)} and {@link #addEventListener(Handler,
+     * @deprecated Use {@link #createMediaSource(MediaItem)} and {@link #addEventListener(Handler,
      *     MediaSourceEventListener)} instead.
      */
     @Deprecated
@@ -244,6 +235,15 @@ public final class ExtractorMediaSource extends BaseMediaSource
   }
 
   /**
+   * @deprecated Use {@link ProgressiveMediaSource#DEFAULT_LOADING_CHECK_INTERVAL_BYTES} instead.
+   */
+  @Deprecated
+  public static final int DEFAULT_LOADING_CHECK_INTERVAL_BYTES =
+      ProgressiveMediaSource.DEFAULT_LOADING_CHECK_INTERVAL_BYTES;
+
+  private final ProgressiveMediaSource progressiveMediaSource;
+
+  /**
    * @param uri The {@link Uri} of the media stream.
    * @param dataSourceFactory A factory for {@link DataSource}s to read the media.
    * @param extractorsFactory A factory for {@link Extractor}s to process the media stream. If the
@@ -258,8 +258,8 @@ public final class ExtractorMediaSource extends BaseMediaSource
       Uri uri,
       DataSource.Factory dataSourceFactory,
       ExtractorsFactory extractorsFactory,
-      Handler eventHandler,
-      EventListener eventListener) {
+      @Nullable Handler eventHandler,
+      @Nullable EventListener eventListener) {
     this(uri, dataSourceFactory, extractorsFactory, eventHandler, eventListener, null);
   }
 
@@ -280,11 +280,17 @@ public final class ExtractorMediaSource extends BaseMediaSource
       Uri uri,
       DataSource.Factory dataSourceFactory,
       ExtractorsFactory extractorsFactory,
-      Handler eventHandler,
-      EventListener eventListener,
-      String customCacheKey) {
-    this(uri, dataSourceFactory, extractorsFactory, MIN_RETRY_COUNT_DEFAULT_FOR_MEDIA, eventHandler,
-        eventListener, customCacheKey, DEFAULT_LOADING_CHECK_INTERVAL_BYTES);
+      @Nullable Handler eventHandler,
+      @Nullable EventListener eventListener,
+      @Nullable String customCacheKey) {
+    this(
+        uri,
+        dataSourceFactory,
+        extractorsFactory,
+        eventHandler,
+        eventListener,
+        customCacheKey,
+        DEFAULT_LOADING_CHECK_INTERVAL_BYTES);
   }
 
   /**
@@ -293,7 +299,6 @@ public final class ExtractorMediaSource extends BaseMediaSource
    * @param extractorsFactory A factory for {@link Extractor}s to process the media stream. If the
    *     possible formats are known, pass a factory that instantiates extractors for those formats.
    *     Otherwise, pass a {@link DefaultExtractorsFactory} to use default extractors.
-   * @param minLoadableRetryCount The minimum number of times to retry if a loading error occurs.
    * @param eventHandler A handler for events. May be null if delivery of events is not required.
    * @param eventListener A listener of events. May be null if delivery of events is not required.
    * @param customCacheKey A custom key that uniquely identifies the original stream. Used for cache
@@ -307,16 +312,15 @@ public final class ExtractorMediaSource extends BaseMediaSource
       Uri uri,
       DataSource.Factory dataSourceFactory,
       ExtractorsFactory extractorsFactory,
-      int minLoadableRetryCount,
-      Handler eventHandler,
-      EventListener eventListener,
-      String customCacheKey,
+      @Nullable Handler eventHandler,
+      @Nullable EventListener eventListener,
+      @Nullable String customCacheKey,
       int continueLoadingCheckIntervalBytes) {
     this(
         uri,
         dataSourceFactory,
         extractorsFactory,
-        minLoadableRetryCount,
+        new DefaultLoadErrorHandlingPolicy(),
         customCacheKey,
         continueLoadingCheckIntervalBytes,
         /* tag= */ null);
@@ -329,85 +333,65 @@ public final class ExtractorMediaSource extends BaseMediaSource
       Uri uri,
       DataSource.Factory dataSourceFactory,
       ExtractorsFactory extractorsFactory,
-      int minLoadableRetryCount,
+      LoadErrorHandlingPolicy loadableLoadErrorHandlingPolicy,
       @Nullable String customCacheKey,
       int continueLoadingCheckIntervalBytes,
       @Nullable Object tag) {
-    this.uri = uri;
-    this.dataSourceFactory = dataSourceFactory;
-    this.extractorsFactory = extractorsFactory;
-    this.minLoadableRetryCount = minLoadableRetryCount;
-    this.customCacheKey = customCacheKey;
-    this.continueLoadingCheckIntervalBytes = continueLoadingCheckIntervalBytes;
-    this.timelineDurationUs = C.TIME_UNSET;
-    this.tag = tag;
+    progressiveMediaSource =
+        new ProgressiveMediaSource(
+            new MediaItem.Builder()
+                .setUri(uri)
+                .setCustomCacheKey(customCacheKey)
+                .setTag(tag)
+                .build(),
+            dataSourceFactory,
+            extractorsFactory,
+            DrmSessionManager.getDummyDrmSessionManager(),
+            loadableLoadErrorHandlingPolicy,
+            continueLoadingCheckIntervalBytes);
+  }
+
+  /**
+   * @deprecated Use {@link #getMediaItem()} and {@link MediaItem.PlaybackProperties#tag} instead.
+   */
+  @SuppressWarnings("deprecation")
+  @Deprecated
+  @Override
+  @Nullable
+  public Object getTag() {
+    return progressiveMediaSource.getTag();
   }
 
   @Override
-  public void prepareSourceInternal(ExoPlayer player, boolean isTopLevelSource) {
-    notifySourceInfoRefreshed(timelineDurationUs, /* isSeekable= */ false);
+  public MediaItem getMediaItem() {
+    return progressiveMediaSource.getMediaItem();
   }
 
   @Override
-  public void maybeThrowSourceInfoRefreshError() throws IOException {
-    // Do nothing.
+  protected void prepareSourceInternal(@Nullable TransferListener mediaTransferListener) {
+    super.prepareSourceInternal(mediaTransferListener);
+    prepareChildSource(/* id= */ null, progressiveMediaSource);
   }
 
   @Override
-  public MediaPeriod createPeriod(MediaPeriodId id, Allocator allocator) {
-    Assertions.checkArgument(id.periodIndex == 0);
-    return new ExtractorMediaPeriod(
-        uri,
-        dataSourceFactory.createDataSource(),
-        extractorsFactory.createExtractors(),
-        minLoadableRetryCount,
-        createEventDispatcher(id),
-        this,
-        allocator,
-        customCacheKey,
-        continueLoadingCheckIntervalBytes);
+  protected void onChildSourceInfoRefreshed(
+      @Nullable Void id, MediaSource mediaSource, Timeline timeline) {
+    refreshSourceInfo(timeline);
+  }
+
+  @Override
+  public MediaPeriod createPeriod(MediaPeriodId id, Allocator allocator, long startPositionUs) {
+    return progressiveMediaSource.createPeriod(id, allocator, startPositionUs);
   }
 
   @Override
   public void releasePeriod(MediaPeriod mediaPeriod) {
-    ((ExtractorMediaPeriod) mediaPeriod).release();
+    progressiveMediaSource.releasePeriod(mediaPeriod);
   }
 
-  @Override
-  public void releaseSourceInternal() {
-    // Do nothing.
-  }
+  @Deprecated
+  private static final class EventListenerWrapper implements MediaSourceEventListener {
 
-  // ExtractorMediaPeriod.Listener implementation.
-
-  @Override
-  public void onSourceInfoRefreshed(long durationUs, boolean isSeekable) {
-    // If we already have the duration from a previous source info refresh, use it.
-    durationUs = durationUs == C.TIME_UNSET ? timelineDurationUs : durationUs;
-    if (timelineDurationUs == durationUs && timelineIsSeekable == isSeekable) {
-      // Suppress no-op source info changes.
-      return;
-    }
-    notifySourceInfoRefreshed(durationUs, isSeekable);
-  }
-
-  // Internal methods.
-
-  private void notifySourceInfoRefreshed(long durationUs, boolean isSeekable) {
-    timelineDurationUs = durationUs;
-    timelineIsSeekable = isSeekable;
-    // TODO: Make timeline dynamic until its duration is known. This is non-trivial. See b/69703223.
-    refreshSourceInfo(
-        new SinglePeriodTimeline(
-            timelineDurationUs, timelineIsSeekable, /* isDynamic= */ false, tag),
-        /* manifest= */ null);
-  }
-
-  /**
-   * Wraps a deprecated {@link EventListener}, invoking its callback from the equivalent callback in
-   * {@link MediaSourceEventListener}.
-   */
-  private static final class EventListenerWrapper extends DefaultMediaSourceEventListener {
     private final EventListener eventListener;
 
     public EventListenerWrapper(EventListener eventListener) {

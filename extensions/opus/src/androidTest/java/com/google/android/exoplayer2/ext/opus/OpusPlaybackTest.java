@@ -15,63 +15,69 @@
  */
 package com.google.android.exoplayer2.ext.opus;
 
+import static org.junit.Assert.fail;
+
 import android.content.Context;
 import android.net.Uri;
 import android.os.Looper;
-import android.test.InstrumentationTestCase;
+import androidx.annotation.Nullable;
+import androidx.test.core.app.ApplicationProvider;
+import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.google.android.exoplayer2.ExoPlaybackException;
 import com.google.android.exoplayer2.ExoPlayer;
-import com.google.android.exoplayer2.ExoPlayerFactory;
+import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.Player;
-import com.google.android.exoplayer2.Renderer;
 import com.google.android.exoplayer2.extractor.mkv.MatroskaExtractor;
-import com.google.android.exoplayer2.source.ExtractorMediaSource;
 import com.google.android.exoplayer2.source.MediaSource;
-import com.google.android.exoplayer2.trackselection.DefaultTrackSelector;
+import com.google.android.exoplayer2.source.ProgressiveMediaSource;
 import com.google.android.exoplayer2.upstream.DefaultDataSourceFactory;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
 
-/**
- * Playback tests using {@link LibopusAudioRenderer}.
- */
-public class OpusPlaybackTest extends InstrumentationTestCase {
+/** Playback tests using {@link LibopusAudioRenderer}. */
+@RunWith(AndroidJUnit4.class)
+public class OpusPlaybackTest {
 
-  private static final String BEAR_OPUS_URI = "asset:///bear-opus.webm";
+  private static final String BEAR_OPUS_URI = "asset:///media/mka/bear-opus.mka";
+  private static final String BEAR_OPUS_NEGATIVE_GAIN_URI =
+      "asset:///media/mka/bear-opus-negative-gain.mka";
 
-  @Override
-  protected void setUp() throws Exception {
-    super.setUp();
+  @Before
+  public void setUp() {
     if (!OpusLibrary.isAvailable()) {
       fail("Opus library not available.");
     }
   }
 
-  public void testBasicPlayback() throws ExoPlaybackException {
+  @Test
+  public void basicPlayback() throws Exception {
     playUri(BEAR_OPUS_URI);
   }
 
-  private void playUri(String uri) throws ExoPlaybackException {
-    TestPlaybackRunnable testPlaybackRunnable = new TestPlaybackRunnable(Uri.parse(uri),
-        getInstrumentation().getContext());
+  @Test
+  public void basicPlaybackNegativeGain() throws Exception {
+    playUri(BEAR_OPUS_NEGATIVE_GAIN_URI);
+  }
+
+  private void playUri(String uri) throws Exception {
+    TestPlaybackRunnable testPlaybackRunnable =
+        new TestPlaybackRunnable(Uri.parse(uri), ApplicationProvider.getApplicationContext());
     Thread thread = new Thread(testPlaybackRunnable);
     thread.start();
-    try {
-      thread.join();
-    } catch (InterruptedException e) {
-      fail(); // Should never happen.
-    }
+    thread.join();
     if (testPlaybackRunnable.playbackException != null) {
       throw testPlaybackRunnable.playbackException;
     }
   }
 
-  private static class TestPlaybackRunnable extends Player.DefaultEventListener
-      implements Runnable {
+  private static class TestPlaybackRunnable implements Player.EventListener, Runnable {
 
     private final Context context;
     private final Uri uri;
 
-    private ExoPlayer player;
-    private ExoPlaybackException playbackException;
+    @Nullable private ExoPlayer player;
+    @Nullable private ExoPlaybackException playbackException;
 
     public TestPlaybackRunnable(Uri uri, Context context) {
       this.uri = uri;
@@ -82,16 +88,15 @@ public class OpusPlaybackTest extends InstrumentationTestCase {
     public void run() {
       Looper.prepare();
       LibopusAudioRenderer audioRenderer = new LibopusAudioRenderer();
-      DefaultTrackSelector trackSelector = new DefaultTrackSelector();
-      player = ExoPlayerFactory.newInstance(new Renderer[] {audioRenderer}, trackSelector);
+      player = new ExoPlayer.Builder(context, audioRenderer).build();
       player.addListener(this);
       MediaSource mediaSource =
-          new ExtractorMediaSource.Factory(
-                  new DefaultDataSourceFactory(context, "ExoPlayerExtOpusTest"))
-              .setExtractorsFactory(MatroskaExtractor.FACTORY)
-              .createMediaSource(uri);
-      player.prepare(mediaSource);
-      player.setPlayWhenReady(true);
+          new ProgressiveMediaSource.Factory(
+                  new DefaultDataSourceFactory(context), MatroskaExtractor.FACTORY)
+              .createMediaSource(MediaItem.fromUri(uri));
+      player.setMediaSource(mediaSource);
+      player.prepare();
+      player.play();
       Looper.loop();
     }
 
@@ -101,7 +106,7 @@ public class OpusPlaybackTest extends InstrumentationTestCase {
     }
 
     @Override
-    public void onPlayerStateChanged(boolean playWhenReady, int playbackState) {
+    public void onPlaybackStateChanged(@Player.State int playbackState) {
       if (playbackState == Player.STATE_ENDED
           || (playbackState == Player.STATE_IDLE && playbackException != null)) {
         player.release();
